@@ -68,17 +68,25 @@ def parse_date(value: str) -> dt.date | None:
 
 
 def session_of(batch_time: str) -> str:
-    """Classify the displayed start time, without guessing/correcting ICAI's text."""
-    match = re.search(r"(\d{1,2})\s*[-:]\s*(\d{1,2})\s*[-:]?\s*(AM|PM)", batch_time, re.I)
-    if not match:
+    """Classify displayed times; flag internally inconsistent ranges instead of guessing."""
+    matches = re.findall(r"(\d{1,2})\s*[-:]\s*(\d{1,2})\s*[-:]?\s*(AM|PM)", batch_time, re.I)
+    if not matches:
         return "Time unclear"
-    hour, minute, ampm = int(match.group(1)), int(match.group(2)), match.group(3).upper()
+    hour, minute, ampm = int(matches[0][0]), int(matches[0][1]), matches[0][2].upper()
     if not (1 <= hour <= 12 and 0 <= minute <= 59):
         return "Time unclear"
-    hour24 = (hour % 12) + (12 if ampm == "PM" else 0)
-    if hour24 < 12:
+    start24 = (hour % 12) + (12 if ampm == "PM" else 0)
+    if len(matches) >= 2:
+        end_hour, end_minute, end_ampm = int(matches[1][0]), int(matches[1][1]), matches[1][2].upper()
+        if not (1 <= end_hour <= 12 and 0 <= end_minute <= 59):
+            return "Time unclear"
+        end24 = (end_hour % 12) + (12 if end_ampm == "PM" else 0)
+        # A PM-to-PM interval that goes backwards is ambiguous in ICAI's display.
+        if end24 * 60 + end_minute <= start24 * 60 + minute and ampm == end_ampm:
+            return "Time unclear (displayed range inconsistent)"
+    if start24 < 12:
         return "Morning"
-    if hour24 < 17:
+    if start24 < 17:
         return "Afternoon"
     return "Evening"
 
