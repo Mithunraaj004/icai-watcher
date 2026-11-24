@@ -232,6 +232,8 @@ def main() -> int:
         except WatcherError as exc:
             log(f"ERROR: {exc}")
             return 2
+        # Manual test runs validate push delivery only; scheduled runs perform the ICAI check.
+        return 0
 
     try:
         rows = fetch_chennai_rows()
