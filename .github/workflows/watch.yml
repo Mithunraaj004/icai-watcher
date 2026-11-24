@@ -1,42 +1,66 @@
-name: ICAI batch watcher
+name: ICAI Chennai Seat Watcher
 
 on:
   schedule:
-    - cron: "*/30 * * * *"      # start a new run every 30 minutes
-  workflow_dispatch:             # lets you start it manually
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      send_test:
+        description: "Send a test notification to the subscribed ntfy topic"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
 
 concurrency:
-  group: icai-watch
+  group: icai-chennai-seat-watcher
   cancel-in-progress: false
 
 jobs:
-  watch:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
 
-      - name: Install dependencies
+      - name: Install Python packages
+        run: python -m pip install -r requirements.txt
+
+      - name: Restore browser cache
+        id: browser-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-chromium-v1
+
+      - name: Install Chromium
         run: |
-          pip install playwright requests
-          playwright install --with-deps chromium
+          if [ "${{ steps.browser-cache.outputs.cache-hit }}" != "true" ]; then
+            python -m playwright install --with-deps chromium
+          else
+            python -m playwright install-deps chromium
+          fi
 
-      - name: Restore state (avoids repeat alerts)
+      - name: Restore batch state
         uses: actions/cache@v4
         with:
           path: icai_state.json
           key: icai-state-${{ github.run_id }}
-          restore-keys: icai-state-
+          restore-keys: |
+            icai-state-
 
-      - name: Watch for ~28 minutes
+      - name: Check ICAI Chennai batches and notify
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          TG_TOKEN: ${{ secrets.TG_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          WA_PHONE: ${{ secrets.WA_PHONE }}
-          WA_APIKEY: ${{ secrets.WA_APIKEY }}
-        run: python icai_batch_watcher.py --minutes 28
+          SEND_TEST_NOTIFICATION: ${{ inputs.send_test || 'false' }}
+        run: python icai_batch_watcher.py
