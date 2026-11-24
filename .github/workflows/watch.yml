@@ -1,4 +1,4 @@
-name: ICAI Chennai Seat Watcher
+name: ICAI Chennai + Chengalpattu Seat Watcher
 
 on:
   schedule:
@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: icai-chennai-seat-watcher
+  group: icai-two-centre-seat-watcher
   cancel-in-progress: false
 
 jobs:
@@ -59,7 +59,7 @@ jobs:
           restore-keys: |
             icai-state-
 
-      - name: Check ICAI Chennai batches and notify
+      - name: Check Chennai and Chengalpattu batches and notify
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           SEND_TEST_NOTIFICATION: ${{ inputs.send_test || 'false' }}
