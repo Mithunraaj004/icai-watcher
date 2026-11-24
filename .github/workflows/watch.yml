@@ -1,0 +1,42 @@
+name: ICAI batch watcher
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"      # start a new run every 30 minutes
+  workflow_dispatch:             # lets you start it manually
+
+concurrency:
+  group: icai-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright requests
+          playwright install --with-deps chromium
+
+      - name: Restore state (avoids repeat alerts)
+        uses: actions/cache@v4
+        with:
+          path: icai_state.json
+          key: icai-state-${{ github.run_id }}
+          restore-keys: icai-state-
+
+      - name: Watch for ~28 minutes
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          WA_PHONE: ${{ secrets.WA_PHONE }}
+          WA_APIKEY: ${{ secrets.WA_APIKEY }}
+        run: python icai_batch_watcher.py --minutes 28
