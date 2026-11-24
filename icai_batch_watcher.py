@@ -160,6 +160,7 @@ def extract_rows(page, selected_pou: str) -> list[dict[str, str]]:
 def fetch_pou_rows(page, selected_pou: str) -> list[dict[str, str]]:
     # Re-select the POU separately for each centre. Region and Course remain fixed.
     choose_option(page, 1, selected_pou)
+    choose_option(page, 2, COURSE)
     get_list = page.locator("input[type='submit'][value='Get List'], button:has-text('Get List')")
     if get_list.count() == 0:
         raise WatcherError("The ICAI Get List button was not found after selecting filters.")
@@ -184,9 +185,7 @@ def fetch_all_pous() -> dict[str, list[dict[str, str]]]:
             if page.locator("select").count() < 3:
                 raise WatcherError("The public ICAI page did not expose the expected three filters.")
             choose_option(page, 0, REGION)
-            # The Course filter is selected once; the POU is changed separately below.
-            choose_option(page, 2, COURSE)
-            results: dict[str, list[dict[str, str]]] = {}
+                    results: dict[str, list[dict[str, str]]] = {}
             for selected_pou in POUS:
                 results[selected_pou] = fetch_pou_rows(page, selected_pou)
             return results
