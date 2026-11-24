@@ -193,7 +193,7 @@ def fetch_all_pous() -> dict[str, list[dict[str, str]]]:
             if page.locator("select").count() < 3:
                 raise WatcherError("The public ICAI page did not expose the expected three filters.")
             choose_option(page, 0, REGION)
-                    results: dict[str, list[dict[str, str]]] = {}
+            results: dict[str, list[dict[str, str]]] = {}
             for selected_pou in POUS:
                 results[selected_pou] = fetch_pou_rows(page, selected_pou)
             return results
