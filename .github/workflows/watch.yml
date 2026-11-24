@@ -37,6 +37,7 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Restore browser cache
+        if: ${{ inputs.send_test != true }}
         id: browser-cache
         uses: actions/cache@v4
         with:
@@ -44,6 +45,7 @@ jobs:
           key: ${{ runner.os }}-playwright-chromium-v1
 
       - name: Install Chromium
+        if: ${{ inputs.send_test != true }}
         run: |
           if [ "${{ steps.browser-cache.outputs.cache-hit }}" != "true" ]; then
             python -m playwright install --with-deps chromium
@@ -52,6 +54,7 @@ jobs:
           fi
 
       - name: Restore batch state
+        if: ${{ inputs.send_test != true }}
         uses: actions/cache@v4
         with:
           path: icai_state.json
@@ -59,8 +62,16 @@ jobs:
           restore-keys: |
             icai-state-
 
-      - name: Check Chennai and Chengalpattu batches and notify
+      - name: Send ntfy test notification
+        if: ${{ inputs.send_test == true }}
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          SEND_TEST_NOTIFICATION: ${{ inputs.send_test || 'false' }}
+          SEND_TEST_NOTIFICATION: "true"
+        run: python icai_batch_watcher.py
+
+      - name: Check Chennai and Chengalpattu batches and notify
+        if: ${{ inputs.send_test != true }}
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          SEND_TEST_NOTIFICATION: "false"
         run: python icai_batch_watcher.py
