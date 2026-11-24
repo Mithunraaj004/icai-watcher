@@ -1,214 +1,283 @@
+"""ICAI ICITSS Orientation Course seat watcher for GitHub Actions + ntfy.
+
+Monitors only Southern / CHENNAI / ICITSS - Orientation Course.
+Only batches with From Date >= 12 January 2027 are eligible.
+Alerts on newly discovered eligible batches and seat-count changes.
 """
-ICAI ICITSS Orientation Course watcher
-Monitors CHENNAI (Nungambakkam, ICAI Bhawan) and Chengalpattu (ICAI Salai) together.
-Alerts when a batch starting ON/AFTER 12-Jan-2027 appears, its seats change,
-or it disappears (full/closed). Every alert says MORNING or AFTERNOON/EVENING.
+from __future__ import annotations
 
-SETUP (once):
-  pip install playwright requests
-  playwright install chromium
+import datetime as dt
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
 
-ALERT CHANNELS (set any you like as environment variables):
-  WhatsApp (free, CallMeBot): WA_PHONE=919876543210   WA_APIKEY=yourkey
-  Telegram:                   TG_TOKEN=...            TG_CHAT_ID=...
-  ntfy.sh push app:           NTFY_TOPIC=some-secret-topic-name
-
-RUN:
-  python icai_batch_watcher.py --debug   # visible browser, single run (test)
-  python icai_batch_watcher.py           # headless, loops forever
-"""
-import argparse, datetime as dt, json, os, re, sys, time
 import requests
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 URL = "https://www.icaionlineregistration.org/launchbatchdetail.aspx"
+REGISTRATION_URL = "https://www.icaionlineregistration.org/Admin_Module/Login.aspx"
 REGION = "Southern"
-POUS = ["CHENNAI", "Chengalpattu"]           # text as shown in the Pou dropdown
+POU = "CHENNAI"
 COURSE = "ICITSS - Orientation Course"
-CUTOFF = dt.date(2027, 1, 12)                # only batches starting on/after this
-LOW_SEATS = 15                               # "filling fast" warning threshold
-INTERVAL_SEC = 60                            # one full check (both centres) per minute
-HEARTBEAT_HOURS = 24
-STATE_FILE = "icai_state.json"
-
-TG_TOKEN = os.environ.get("TG_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-WA_PHONE = os.environ.get("WA_PHONE", "")
-WA_APIKEY = os.environ.get("WA_APIKEY", "")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
+CUTOFF = dt.date(2027, 1, 12)
+STATE_FILE = Path("icai_state.json")
+NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
+NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 
 
-def notify(msg):
-    print(f"[{dt.datetime.now():%d-%b %H:%M:%S}] {msg}\n")
-    full = msg + "\n\nRegister: " + URL
-    if WA_PHONE and WA_APIKEY:
-        try:
-            requests.get("https://api.callmebot.com/whatsapp.php",
-                         params={"phone": WA_PHONE, "text": full, "apikey": WA_APIKEY},
-                         timeout=20)
-        except Exception as e:
-            print("WhatsApp error:", e)
-    if NTFY_TOPIC:
-        try:
-            requests.post(f"https://ntfy.sh/{NTFY_TOPIC}", data=full.encode("utf-8"),
-                          headers={"Priority": "urgent", "Title": "ICAI batch alert"},
-                          timeout=15)
-        except Exception as e:
-            print("ntfy error:", e)
-    if TG_TOKEN and TG_CHAT_ID:
-        try:
-            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                          data={"chat_id": TG_CHAT_ID, "text": full}, timeout=15)
-        except Exception as e:
-            print("Telegram error:", e)
+class WatcherError(RuntimeError):
+    """Raised when the public ICAI listing cannot be checked reliably."""
 
 
-def parse_date(s):
+def log(message: str) -> None:
+    stamp = dt.datetime.now(dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def send_ntfy(title: str, message: str, *, priority: str = "high", tags: str = "bell") -> None:
+    if not NTFY_TOPIC:
+        raise WatcherError("GitHub Actions secret NTFY_TOPIC is missing. Add it under Settings > Secrets and variables > Actions.")
+    # The topic is deliberately read only from an Actions secret; never print it.
+    endpoint = f"{NTFY_SERVER}/{NTFY_TOPIC}"
     try:
-        return dt.datetime.strptime(s.strip(), "%d/%m/%Y").date()
-    except Exception:
+        response = requests.post(
+            endpoint,
+            data=message.encode("utf-8"),
+            headers={
+                "Title": title,
+                "Priority": priority,
+                "Tags": tags,
+                "Content-Type": "text/plain; charset=utf-8",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise WatcherError(f"ntfy notification failed: {exc}") from exc
+
+
+def parse_date(value: str) -> dt.date | None:
+    try:
+        return dt.datetime.strptime(value.strip(), "%d/%m/%Y").date()
+    except (TypeError, ValueError):
         return None
 
 
-def session_of(batch_time):
-    """MORNING or AFTERNOON/EVENING from text like '7-0-AM to 1-0-PM',
-    '1-30-PM to 7-30-PM'. The site sometimes shows '7-0-PM to 1-30-PM'
-    (start after end) which can only mean 7 AM - 1:30 PM."""
-    t = " ".join(batch_time.split())
-    m = re.findall(r"(\d{1,2})\s*[-:]\s*(\d{1,2})\s*[-:]?\s*(AM|PM)", t, re.I)
-    if len(m) < 2:
-        return "UNKNOWN"
-
-    def to24(h, mi, ap):
-        return (int(h) % 12) + (12 if ap.upper() == "PM" else 0) + int(mi) / 60
-
-    start, end = to24(*m[0]), to24(*m[1])
-    if end <= start:                      # impossible -> start was really AM
-        start = to24(m[0][0], m[0][1], "AM")
-    return "MORNING" if start < 12 else "AFTERNOON/EVENING"
+def session_of(batch_time: str) -> str:
+    """Classify only the displayed start time; never 'correct' a strange time range."""
+    match = re.search(r"(\d{1,2})\s*[-:]\s*(\d{1,2})\s*[-:]?\s*(AM|PM)", batch_time, re.I)
+    if not match:
+        return "Time unclear"
+    hour, minute, ampm = int(match.group(1)), int(match.group(2)), match.group(3).upper()
+    if not (1 <= hour <= 12 and 0 <= minute <= 59):
+        return "Time unclear"
+    hour24 = (hour % 12) + (12 if ampm == "PM" else 0)
+    if hour24 < 12:
+        return "Morning"
+    if hour24 < 17:
+        return "Afternoon"
+    return "Evening"
 
 
-def fetch_rows(page, pou):
-    page.goto(URL, wait_until="networkidle")
+def load_state() -> dict[str, Any]:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("seen"), dict):
+            raise ValueError("invalid state structure")
+        return data
+    except FileNotFoundError:
+        return {"seen": {}}
+    except Exception as exc:
+        log(f"State file could not be read; starting a fresh baseline: {exc}")
+        return {"seen": {}}
 
-    def choose(idx, text):
-        sel = page.locator("select").nth(idx)
-        opts = [o.strip() for o in sel.locator("option").all_inner_texts()]
-        match = next((o for o in opts if o.lower() == text.lower()), None)
-        if match is None:
-            raise RuntimeError(f"'{text}' not in dropdown #{idx}: {opts}")
-        sel.select_option(label=match)
-        page.wait_for_load_state("networkidle")   # ASP.NET postback
 
-    choose(0, REGION)
-    choose(1, pou)
-    choose(2, COURSE)
-    page.locator("input[value='Get List'], button:has-text('Get List')").first.click()
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(1500)
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    rows = []
-    for tr in page.locator("table tr").all():
-        c = [x.strip() for x in tr.locator("td").all_inner_texts()]
-        # Batch No | Seats | From | To | Time | Pou | Course | Open For | Venue | Register
-        if len(c) >= 8 and parse_date(c[2]) and c[5].strip().lower() == pou.lower():
+
+def choose_option(page, select_index: int, label: str) -> None:
+    select = page.locator("select").nth(select_index)
+    if select.count() == 0:
+        raise WatcherError(f"Expected filter dropdown #{select_index + 1} was not found.")
+    available = [x.strip() for x in select.locator("option").all_inner_texts()]
+    chosen = next((x for x in available if x.casefold() == label.casefold()), None)
+    if chosen is None:
+        raise WatcherError(f"Filter option '{label}' is not available in dropdown #{select_index + 1}. Options: {available}")
+    select.select_option(label=chosen)
+    # ICAI uses ASP.NET AutoPostBack for the dependent filters.
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except PlaywrightTimeoutError:
+        pass
+
+
+def extract_rows(page) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    tables = page.locator("table")
+    for table_index in range(tables.count()):
+        table = tables.nth(table_index)
+        for tr in table.locator("tr").all():
+            cells = [" ".join(x.split()) for x in tr.locator("td").all_inner_texts()]
+            if len(cells) < 8:
+                continue
+            if parse_date(cells[2]) is None:
+                continue
+            pou = cells[5].strip()
+            course = cells[6].strip()
+            if pou.casefold() != POU.casefold() or course.casefold() != COURSE.casefold():
+                continue
+            venue = cells[8] if len(cells) >= 9 else ""
+            category = session_of(cells[4])
             rows.append({
-                "batch": " ".join(c[0].split()), "seats": c[1], "from": c[2],
-                "to": c[3], "time": " ".join(c[4].split()), "pou": c[5],
-                "open_for": c[7],
-                "venue": " ".join(c[8].split()) if len(c) > 8 else "",
-                "session": session_of(c[4]),
+                "batch_no": cells[0],
+                "available_seats": cells[1],
+                "from_date": cells[2],
+                "to_date": cells[3],
+                "batch_time": cells[4],
+                "pou_name": pou,
+                "course": course,
+                "open_for": cells[7],
+                "course_venue": venue,
+                "session": category,
             })
-    return rows
+    # Deduplicate rows if the portal repeats a grid in nested layout tables.
+    unique: dict[str, dict[str, str]] = {}
+    for row in rows:
+        unique[row["batch_no"]] = row
+    return list(unique.values())
 
 
-def fmt(r):
-    return (f"{r['pou'].upper()} - {r['batch']}\n"
-            f"  {r['session']} batch ({r['time']})\n"
-            f"  {r['from']} to {r['to']}\n"
-            f"  Seats available: {r['seats']}  |  Open for: {r['open_for']}\n"
-            f"  Venue: {r['venue'][:70]}")
+def fetch_chennai_rows() -> list[dict[str, str]]:
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.set_default_timeout(20000)
+        try:
+            page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+            if page.locator("select").count() < 3:
+                raise WatcherError("The public ICAI page did not expose the expected three filters.")
+            choose_option(page, 0, REGION)
+            choose_option(page, 1, POU)
+            choose_option(page, 2, COURSE)
+            get_list = page.locator("input[type='submit'][value='Get List'], button:has-text('Get List')")
+            if get_list.count() == 0:
+                raise WatcherError("The ICAI Get List button was not found after selecting the filters.")
+            get_list.first.click()
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=20000)
+            except PlaywrightTimeoutError:
+                pass
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except PlaywrightTimeoutError:
+                pass
+            page.wait_for_timeout(1000)
+            body_text = page.locator("body").inner_text()
+            if "Batch No" not in body_text or "Available Seats" not in body_text:
+                raise WatcherError("The ICAI result table did not load; the page may be blocked or its layout has changed.")
+            return extract_rows(page)
+        except WatcherError:
+            raise
+        except Exception as exc:
+            raise WatcherError(f"Unable to read the ICAI listing: {type(exc).__name__}: {exc}") from exc
+        finally:
+            browser.close()
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--debug", action="store_true")
-    ap.add_argument("--minutes", type=float, default=0,
-                    help="stop after this many minutes (used by GitHub Actions)")
-    args = ap.parse_args()
-    deadline = time.time() + args.minutes * 60 if args.minutes else None
+def format_batch(row: dict[str, str]) -> str:
+    venue = row.get("course_venue") or "Not shown in public results"
+    seats = row.get("available_seats") or "Not shown"
+    return (
+        f"POU: {row['pou_name']}\n"
+        f"Batch No: {row['batch_no']}\n"
+        f"Available Seats: {seats}\n"
+        f"From: {row['from_date']} | To: {row['to_date']}\n"
+        f"Batch Time: {row['batch_time']}\n"
+        f"Session: {row['session']}\n"
+        f"Open For: {row['open_for']}\n"
+        f"Course Venue: {venue}\n"
+        f"Course: {row['course']}\n\n"
+        f"Check/register: {URL}\n"
+        f"Registration login: {REGISTRATION_URL}"
+    )
+
+
+def run_test_notification() -> None:
+    send_ntfy(
+        "ICAI Seat Watcher – Test",
+        "Your Android ntfy notification is connected. The watcher is configured for Southern / CHENNAI / ICITSS - Orientation Course, with batch From Date on or after 12-Jan-2027.",
+        priority="default",
+        tags="white_check_mark",
+    )
+    log("Test notification sent to ntfy.")
+
+
+def main() -> int:
+    if not NTFY_TOPIC:
+        log("ERROR: GitHub Actions secret NTFY_TOPIC is missing.")
+        return 2
+
+    if os.environ.get("SEND_TEST_NOTIFICATION", "false").lower() == "true":
+        try:
+            run_test_notification()
+        except WatcherError as exc:
+            log(f"ERROR: {exc}")
+            return 2
 
     try:
-        state = json.load(open(STATE_FILE))
-    except Exception:
-        state = {"seen": {}, "last_heartbeat": 0}
+        rows = fetch_chennai_rows()
+    except WatcherError as exc:
+        log(f"CHECK FAILED: {exc}")
+        try:
+            send_ntfy("ICAI watcher – check failed", str(exc), priority="high", tags="warning")
+        except WatcherError as notify_exc:
+            log(f"Could not send failure notification: {notify_exc}")
+        return 1
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not args.debug)
-        page = browser.new_page()
-        fails = 0
-        while True:
-            try:
-                total = 0
-                for pou in POUS:
-                    rows = fetch_rows(page, pou)
-                    total += len(rows)
-                    print(f"[{dt.datetime.now():%H:%M:%S}] {pou}: {len(rows)} batches")
-                    for r in rows:
-                        print("  ", r["batch"], r["from"], r["session"], "seats:", r["seats"])
+    eligible: dict[str, dict[str, str]] = {}
+    for row in rows:
+        start_date = parse_date(row["from_date"])
+        if start_date and start_date >= CUTOFF:
+            eligible[row["batch_no"]] = row
 
-                    current = set()
-                    for r in rows:
-                        start = parse_date(r["from"])
-                        key = r["batch"]
-                        current.add(key)
-                        prev = state["seen"].get(key)
-                        target = start >= CUTOFF
+    log(f"CHENNAI: read {len(rows)} result row(s); {len(eligible)} eligible batch(es) from {CUTOFF:%d-%m-%Y} onwards.")
+    state = load_state()
+    seen: dict[str, Any] = state.setdefault("seen", {})
+    alerts_sent = 0
 
-                        if prev is None:
-                            if target:
-                                notify(f"NEW TARGET BATCH OPEN!\n{fmt(r)}")
-                            else:
-                                notify(f"New batch listed (before your cutoff):\n{fmt(r)}")
-                        elif target and prev["seats"] != r["seats"]:
-                            try:
-                                low = int(r["seats"]) <= LOW_SEATS
-                            except ValueError:
-                                low = False
-                            head = "SEATS FILLING FAST" if low else "Seats changed"
-                            notify(f"{head}: {prev['seats']} -> {r['seats']}\n{fmt(r)}")
-                        state["seen"][key] = r
+    for batch_no, row in eligible.items():
+        previous = seen.get(batch_no)
+        if previous is None:
+            send_ntfy("NEW ICAI CHENNAI BATCH", format_batch(row), priority="urgent", tags="rotating_light,new")
+            alerts_sent += 1
+            log(f"New eligible batch: {batch_no}")
+        elif str(previous.get("available_seats", "")) != str(row.get("available_seats", "")):
+            old_seats = previous.get("available_seats", "Unknown")
+            new_seats = row.get("available_seats", "Unknown")
+            send_ntfy(
+                "ICAI CHENNAI SEAT COUNT CHANGED",
+                f"Batch: {batch_no}\nAvailable seats changed: {old_seats} -> {new_seats}\n\n{format_batch(row)}",
+                priority="urgent",
+                tags="bell,information_source",
+            )
+            alerts_sent += 1
+            log(f"Seat count changed for {batch_no}: {old_seats} -> {new_seats}")
+        seen[batch_no] = row
 
-                    # target batches of this centre that vanished (full / closed)
-                    for key, old in list(state["seen"].items()):
-                        if old["pou"].lower() == pou.lower() and key not in current:
-                            if parse_date(old["from"]) >= CUTOFF:
-                                notify(f"Target batch REMOVED (full/closed?):\n{fmt(old)}")
-                            del state["seen"][key]
-
-                fails = 0
-                if time.time() - state["last_heartbeat"] > HEARTBEAT_HOURS * 3600:
-                    notify(f"Watcher alive. Watching {', '.join(POUS)} for batches "
-                           f"from {CUTOFF:%d-%b-%Y}. {total} batch(es) listed now.")
-                    state["last_heartbeat"] = time.time()
-                json.dump(state, open(STATE_FILE, "w"))
-            except Exception as e:
-                fails += 1
-                print("Check failed:", e)
-                if fails == 10:
-                    notify(f"Watcher has failed 10 times in a row: {e}")
-                if args.debug:
-                    input("Press Enter to close...")
-                    sys.exit(1)
-
-            if args.debug:
-                input("Debug run finished. Press Enter to close...")
-                break
-            if deadline and time.time() + INTERVAL_SEC > deadline:
-                break
-            time.sleep(INTERVAL_SEC)
-        browser.close()
+    # Retain missing records: if a batch reappears, compare it to its last known seat count.
+    save_state(state)
+    log(f"Check completed successfully. Alerts sent: {alerts_sent}.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
