@@ -63,7 +63,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           SEND_TEST: ${{ github.event.inputs.send_test }}
           RUN_MINUTES: ${{ github.event_name == 'schedule' && '55' || (github.event.inputs.continuous == 'true' && '340' || '0') }}
-          CHECK_INTERVAL_SEC: "180"
+          CHECK_INTERVAL_SEC: "120"
         run: python icai_batch_watcher.py
 
       - name: Save state
