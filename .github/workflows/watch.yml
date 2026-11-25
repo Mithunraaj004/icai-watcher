@@ -2,7 +2,7 @@ name: ICAI Orientation Seat Watcher
 
 on:
   schedule:
-    - cron: "*/10 * * * *"      # a new 55-minute watching session is queued every 10 minutes
+    - cron: "*/10 * * * *"      # backup trigger (GitHub may run it late or skip it)
   workflow_dispatch:
     inputs:
       send_test:
@@ -10,22 +10,30 @@ on:
         required: false
         type: boolean
         default: false
+      continuous:
+        description: "Watch for ~5.5 hours, then automatically start the next session (tick this to go live)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  actions: write                # lets a finished session start the next one
 
-# One scheduled session runs at a time; the next one waits in the queue and starts the
-# moment the previous ends, so checking is continuous. Manual runs use their own group
-# so a test never has to wait for a scheduled session.
+# Scheduled and continuous sessions share one queue so only one watches at a time.
+# Quick manual tests use their own group so they never wait.
 concurrency:
-  group: icai-watch-${{ github.event_name }}
+  group: ${{ (github.event_name == 'schedule' || github.event.inputs.continuous == 'true') && 'icai-watch-main' || 'icai-watch-manual' }}
   cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 70
+    timeout-minutes: 355
     steps:
+      - name: Note start time
+        run: echo "SESSION_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
@@ -49,11 +57,12 @@ jobs:
           restore-keys: icai-state-v3-
 
       - name: Run watcher
+        id: watch
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           EVENT_NAME: ${{ github.event_name }}
           SEND_TEST: ${{ github.event.inputs.send_test }}
-          RUN_MINUTES: ${{ github.event_name == 'schedule' && '55' || '0' }}
+          RUN_MINUTES: ${{ github.event_name == 'schedule' && '55' || (github.event.inputs.continuous == 'true' && '340' || '0') }}
           CHECK_INTERVAL_SEC: "60"
         run: python icai_batch_watcher.py
 
@@ -63,6 +72,18 @@ jobs:
         with:
           path: icai_state.json
           key: icai-state-v3-${{ github.run_id }}
+
+      - name: Start the next session
+        if: ${{ !cancelled() && github.event.inputs.continuous == 'true' && github.event.inputs.send_test != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          elapsed=$(( $(date +%s) - SESSION_START ))
+          if [ "$elapsed" -lt 600 ]; then
+            echo "Session ended after only ${elapsed}s - not chaining (prevents a fast restart loop)."
+            exit 0
+          fi
+          gh workflow run watch.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f continuous=true
 
       - name: Upload debug files on failure
         if: ${{ failure() }}
