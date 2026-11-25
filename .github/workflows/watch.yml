@@ -1,12 +1,12 @@
-name: ICAI Chennai + Chengalpattu Seat Watcher
+name: ICAI Orientation Seat Watcher
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"      # a new 55-minute watching session is queued every 10 minutes
   workflow_dispatch:
     inputs:
       send_test:
-        description: "Send a test notification to the subscribed ntfy topic"
+        description: "Only send a test phone notification (skip the ICAI check)"
         required: false
         type: boolean
         default: false
@@ -14,64 +14,61 @@ on:
 permissions:
   contents: read
 
+# One scheduled session runs at a time; the next one waits in the queue and starts the
+# moment the previous ends, so checking is continuous. Manual runs use their own group
+# so a test never has to wait for a scheduled session.
 concurrency:
-  group: icai-two-centre-seat-watcher
+  group: icai-watch-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 70
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
+          cache: pip
           cache-dependency-path: requirements.txt
 
       - name: Install Python packages
         run: python -m pip install -r requirements.txt
 
-      - name: Restore browser cache
-        if: ${{ inputs.send_test != true }}
-        id: browser-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-chromium-v1
-
       - name: Install Chromium
-        if: ${{ inputs.send_test != true }}
-        run: |
-          if [ "${{ steps.browser-cache.outputs.cache-hit }}" != "true" ]; then
-            python -m playwright install --with-deps chromium
-          else
-            python -m playwright install-deps chromium
-          fi
+        if: ${{ github.event.inputs.send_test != 'true' }}
+        run: python -m playwright install --with-deps chromium
 
-      - name: Restore batch state
-        if: ${{ inputs.send_test != true }}
-        uses: actions/cache@v4
+      - name: Restore state
+        uses: actions/cache/restore@v4
         with:
           path: icai_state.json
-          key: icai-state-${{ github.run_id }}
-          restore-keys: |
-            icai-state-
+          key: icai-state-v3-${{ github.run_id }}
+          restore-keys: icai-state-v3-
 
-      - name: Send ntfy test notification
-        if: ${{ inputs.send_test == true }}
+      - name: Run watcher
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          SEND_TEST_NOTIFICATION: "true"
+          EVENT_NAME: ${{ github.event_name }}
+          SEND_TEST: ${{ github.event.inputs.send_test }}
+          RUN_MINUTES: ${{ github.event_name == 'schedule' && '55' || '0' }}
+          CHECK_INTERVAL_SEC: "60"
         run: python icai_batch_watcher.py
 
-      - name: Check Chennai and Chengalpattu batches and notify
-        if: ${{ inputs.send_test != true }}
-        env:
-          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          SEND_TEST_NOTIFICATION: "false"
-        run: python icai_batch_watcher.py
+      - name: Save state
+        if: ${{ always() && github.event.inputs.send_test != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: icai_state.json
+          key: icai-state-v3-${{ github.run_id }}
+
+      - name: Upload debug files on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 3
