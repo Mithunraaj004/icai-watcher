@@ -13,7 +13,8 @@ Environment variables
     NTFY_TOPIC          (required) private topic you subscribed to in the ntfy app
     RUN_MINUTES         keep checking for this many minutes (0 = a single check)
     CHECK_INTERVAL_SEC  seconds between checks (default 60)
-    EVENT_NAME          github.event_name ("workflow_dispatch" = manual run -> status message)
+    EVENT_NAME          github.event_name ("workflow_dispatch" = run started by you -> status message)
+    CHAINED             "true" when the run was started automatically by the previous session (no status message)
     SEND_TEST           "true" = only send a test phone notification
     ICAI_URL, NTFY_SERVER, BROWSER_EXECUTABLE, BROWSER_ARGS   (testing overrides, normally unset)
 """
@@ -47,7 +48,7 @@ LOW_SEATS = 15                            # flag "filling fast" at or below this
 
 RUN_MINUTES = float(os.environ.get("RUN_MINUTES", "0") or 0)
 CHECK_INTERVAL_SEC = float(os.environ.get("CHECK_INTERVAL_SEC", "60") or 60)
-HEARTBEAT_SEC = 24 * 3600                 # daily "still alive" status
+HEARTBEAT_HOUR_IST = 9                    # daily "still alive" message, sent once a day after this hour (IST)
 FAILURE_ALERT_GAP_SEC = 3 * 3600          # do not spam if ICAI is down
 REMOVAL_CONFIRMATIONS = 2                 # a batch must be missing this many checks in a row
 WATCHDOG_SEC = 300                        # kill the run if one check hangs this long
@@ -57,6 +58,7 @@ DEBUG_DIR = Path("debug")
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 EVENT_NAME = os.environ.get("EVENT_NAME", "")
+CHAINED_RUN = os.environ.get("CHAINED", "").lower() == "true"   # started automatically by the previous session
 BROWSER_EXECUTABLE = os.environ.get("BROWSER_EXECUTABLE", "") or None
 BROWSER_ARGS = os.environ.get("BROWSER_ARGS", "").split()
 IST = ZoneInfo("Asia/Kolkata")
@@ -187,12 +189,15 @@ def short_session(s: str) -> str:
 # --------------------------------------------------------------------------- state
 def load_state() -> dict[str, Any]:
     fresh: dict[str, Any] = {"v": 3, "initialized": False, "seen": {}, "missing": {},
-                             "last_heartbeat": 0, "last_failure_alert": 0, "failing": False}
+                             "last_heartbeat": 0, "last_heartbeat_date": "", "last_failure_alert": 0,
+                             "failing": False}
     try:
         d = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(d, dict) and d.get("v") == 3 and isinstance(d.get("seen"), dict):
             for k, v in fresh.items():
                 d.setdefault(k, v)
+            if not d["last_heartbeat_date"] and d["last_heartbeat"]:      # upgrade from older state
+                d["last_heartbeat_date"] = dt.datetime.fromtimestamp(d["last_heartbeat"], IST).strftime("%Y-%m-%d")
             return d
         log("State file has an unknown format; starting a fresh baseline.")
     except FileNotFoundError:
@@ -513,6 +518,12 @@ def process(results: dict[str, dict[str, Any]], state: dict[str, Any]) -> int:
     return alerts
 
 
+def daily_status_due(state: dict[str, Any], now: dt.datetime | None = None) -> bool:
+    """True once per IST calendar day, after HEARTBEAT_HOUR_IST."""
+    now = now or now_ist()
+    return now.hour >= HEARTBEAT_HOUR_IST and state.get("last_heartbeat_date") != now.strftime("%Y-%m-%d")
+
+
 # --------------------------------------------------------------------------- main loop
 def main() -> int:
     if not NTFY_TOPIC:
@@ -547,20 +558,21 @@ def main() -> int:
             summary = status_text(results)
             if first:
                 log("Current listing:\n" + summary)
-            manual = EVENT_NAME == "workflow_dispatch" and first
-            if manual or time.time() - state["last_heartbeat"] > HEARTBEAT_SEC:
+            manual = EVENT_NAME == "workflow_dispatch" and not CHAINED_RUN and first
+            if manual or daily_status_due(state):
                 why = "manual check" if manual else "daily status"
                 notify(f"ICAI watcher OK - {why}",
                        f"Orientation Course, checking about every {CHECK_INTERVAL_SEC:.0f}s. "
                        f"Target: batches from {CUTOFF:%d-%b-%Y}.\n\n{summary}",
                        priority="default", tags="white_check_mark")
                 state["last_heartbeat"] = time.time()
+                state["last_heartbeat_date"] = now_ist().strftime("%Y-%m-%d")
             log(f"Check OK. Alerts sent this check: {alerts}")
         except WatcherError as exc:
             log(f"CHECK FAILED: {exc}")
             state["failing"] = True
             gap = time.time() - state["last_failure_alert"]
-            if gap > FAILURE_ALERT_GAP_SEC or (EVENT_NAME == "workflow_dispatch" and first):
+            if gap > FAILURE_ALERT_GAP_SEC or (EVENT_NAME == "workflow_dispatch" and not CHAINED_RUN and first):
                 notify("ICAI watcher: check failed", f"{exc}\n\nCheck manually: {URL}",
                        priority="default", tags="warning", click=URL)
                 state["last_failure_alert"] = time.time()
