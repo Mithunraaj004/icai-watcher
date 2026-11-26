@@ -15,6 +15,11 @@ on:
         required: false
         type: boolean
         default: false
+      chained:
+        description: "Leave unticked. Set automatically when a session starts the next one."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,8 +67,9 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           EVENT_NAME: ${{ github.event_name }}
           SEND_TEST: ${{ github.event.inputs.send_test }}
+          CHAINED: ${{ github.event.inputs.chained }}
           RUN_MINUTES: ${{ github.event_name == 'schedule' && '55' || (github.event.inputs.continuous == 'true' && '340' || '0') }}
-          CHECK_INTERVAL_SEC: "120"
+          CHECK_INTERVAL_SEC: "60"
         run: python icai_batch_watcher.py
 
       - name: Save state
@@ -83,7 +89,7 @@ jobs:
             echo "Session ended after only ${elapsed}s - not chaining (prevents a fast restart loop)."
             exit 0
           fi
-          gh workflow run watch.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f continuous=true
+          gh workflow run watch.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f continuous=true -f chained=true
 
       - name: Upload debug files on failure
         if: ${{ failure() }}
